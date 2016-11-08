@@ -1,0 +1,5 @@
+# pscan extension
+comment = 'various parallel scanning test'
+default_version = '1.0'
+module_pathname = '$libdir/pscan'
+relocatable = true
