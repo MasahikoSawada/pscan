@@ -404,9 +404,6 @@ brangescan_scan_worker(Relation onerel, BlockNumber begin, BlockNumber nblocks,
 	BlockNumber end = begin + nblocks;
 	BufferAccessStrategy bstrategy;
 
-	fprintf(stderr, "[%d] begin %u, end %u, n %u\n",
-			ParallelWorkerNumber, begin, end, nblocks);
-
 	bstrategy = GetAccessStrategy(BAS_NORMAL);
 
 	for (blkno = begin; blkno < end; blkno++)
