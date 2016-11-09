@@ -31,7 +31,7 @@
 #define KEY_TUPLESCAN_TASK			502
 
 /* Keys for brange scan */
-#define KEY_BRANGESCAN_PARALLEL_SCAN 501
+#define KEY_BRANGESCAN_TASK			503
 
 PG_MODULE_MAGIC;
 
@@ -60,13 +60,13 @@ typedef struct TupleScanTask
 typedef struct BRangeScanTask
 {
 	Oid relid;
-	int	workers;
-	int	blocks;
-} BRnageScanTask;
+	int	nworkers;
+	int	nblocks;
+} BRangeScanTask;
 
 /* Common */
 void _PG_init(void);
-static void report_stats(PScanStats *stat);
+static BlockNumber report_stats(PScanStats *stat);
 
 /* For tuple scan mode */
 static void tuplescan_estimate_dsm(ParallelContext *pcxt, Snapshot snapshot);
@@ -79,13 +79,24 @@ static void tuplescan_initialize_worker(shm_toc *toc, ParallelHeapScanDesc *psca
 										TupleScanTask **task, PScanStats **stats);
 
 /* For brange scan mode */
+static void brangescan_estimate_dsm(ParallelContext *pcxt);
+static PScanStats *brangescan_initialize_dsm(ParallelContext *pcxt, Relation onerel);
+static void p_brangescan_worker(dsm_segment *seg, shm_toc *toc);
+static void brangescan_scan_worker(Relation onerel, BlockNumber begin,
+								   BlockNumber nblocks, PScanStats *stats);
+static void brangescan_initialize_worker(shm_toc *toc, BRangeScanTask **task,
+										 PScanStats **stats);
 
 /*
  * ----------------------------------------------------------------
  * Common Functions
  * ----------------------------------------------------------------
  */
-static void
+
+/*
+ * Report scan statistics and return total block numer.
+ */
+static BlockNumber
 report_stats(PScanStats *all_stats)
 {
 	StringInfoData info;
@@ -104,6 +115,8 @@ report_stats(PScanStats *all_stats)
 
 	elog(NOTICE, "--- Total ---");
 	elog(NOTICE, "n_read_tup = %u", ntuples);
+
+	return ntuples;
 }
 void
 _PG_init(void)
@@ -269,6 +282,7 @@ p_tuplescan(PG_FUNCTION_ARGS)
 	Relation onerel;
 	Snapshot snapshot;
 	PScanStats *all_stats;
+	BlockNumber tuples;
 
 	onerel = try_relation_open(relid, AccessShareLock);
 	
@@ -291,7 +305,7 @@ p_tuplescan(PG_FUNCTION_ARGS)
 	WaitForParallelWorkersToFinish(pcxt);
 	
 	/* Report all statistics */
-	report_stats(all_stats);
+	tuples = report_stats(all_stats);
 
 	/* Finalize parallel scanning */
 	DestroyParallelContext(pcxt);
@@ -299,7 +313,7 @@ p_tuplescan(PG_FUNCTION_ARGS)
 	
 	relation_close(onerel, AccessShareLock);
 
-	PG_RETURN_NULL();
+	PG_RETURN_UINT32(tuples);
 }
 
 /*
@@ -310,13 +324,16 @@ p_tuplescan(PG_FUNCTION_ARGS)
 
 /* Estimate DSM size for brange scan mode */
 static void
-brangescan_estimate_dsm(pcxt)
+brangescan_estimate_dsm(ParallelContext *pcxt)
 {
 	int size = 0;
 	int keys = 0;
 
 	size += BUFFERALIGN(sizeof(BRangeScanTask));
-	keys ++;
+	keys++;
+
+	size += BUFFERALIGN(sizeof(PScanStats) * pscan_workers);
+	keys++;
 
 	shm_toc_estimate_chunk(&pcxt->estimator, size);
 	shm_toc_estimate_keys(&pcxt->estimator, keys);
@@ -325,33 +342,34 @@ brangescan_estimate_dsm(pcxt)
 static PScanStats*
 brangescan_initialize_dsm(ParallelContext *pcxt, Relation onerel)
 {
-	BlockNumber nblocks;
 	BRangeScanTask *task;
 	PScanStats	*stats;
 
 	/* Prepare for brange scan task */
-	task = (TupleScanTask *) shm_toc_allocate(pcxt->toc,
+	task = (BRangeScanTask *) shm_toc_allocate(pcxt->toc,
 											  sizeof(BRangeScanTask));
 	shm_toc_insert(pcxt->toc, KEY_BRANGESCAN_TASK, task);
-	task->relid = onerel->rd_relid;
+	task->relid = onerel->rd_id;
 	task->nworkers = pscan_workers;
-	task->nblocks = RelationGetNumberOfBlock(onerel);
+	task->nblocks = RelationGetNumberOfBlocks(onerel);
 
 	/* Prepare for stats */
-	task = (PScanStats *) shm_toc_allocate(pcxt->toc,
-										   sizeof(PScanState) * pscan_workers);
+	stats = (PScanStats *) shm_toc_allocate(pcxt->toc,
+										   sizeof(PScanStats) * pscan_workers);
 	shm_toc_insert(pcxt->toc, KEY_PSCAN_STATS, stats);
+
+	return stats;
 }
 
 /* Entry point for parallel worker in brange scan mode */
 static void
 p_brangescan_worker(dsm_segment *seg, shm_toc *toc)
 {
-	TupleScanTask *task;
+	BRangeScanTask *task;
 	PScanStats	*stats;
 	Relation rel;
 	BlockNumber begin;
-	BlockNumber nblocks_woker;
+	BlockNumber nblocks_worker;
 	BlockNumber nblocks_per_worker;
 
 	/* Initialize worker information */
@@ -361,18 +379,18 @@ p_brangescan_worker(dsm_segment *seg, shm_toc *toc)
 
 	/* Calculate begin block nubmer and the number of blocks have to read */
 	nblocks_per_worker = task->nblocks / task->nworkers;
-	begin = nblock_per_worker * ParallelWorkerNumber + 1;
+	begin = nblocks_per_worker * ParallelWorkerNumber;
 	if (begin + nblocks_per_worker > task->nblocks)
-		nblocks = task->nblocks - begin;
+		nblocks_worker = task->nblocks - begin;
 	else
-		nblocks = nblocks_per_worker;
+		nblocks_worker = nblocks_per_worker;
 
-	brangescan_scan_worker(rel, begin, nblocks, stats);
+	brangescan_scan_worker(rel, begin, nblocks_worker, stats);
 
 	/* Save to statistics */
 	stats->begin_blkno = begin;
-	stats->end_blkno = begin + nblocks;
-	stats->nblocks = nblocks;
+	stats->end_blkno = begin + nblocks_worker;
+	stats->nblocks = nblocks_worker;
 
 	heap_close(rel, NoLock);
 }
@@ -384,23 +402,43 @@ brangescan_scan_worker(Relation onerel, BlockNumber begin, BlockNumber nblocks,
 	BlockNumber n_read_tup = 0;
 	BlockNumber blkno;
 	BlockNumber end = begin + nblocks;
+	BufferAccessStrategy bstrategy;
+
+	fprintf(stderr, "[%d] begin %u, end %u, n %u\n",
+			ParallelWorkerNumber, begin, end, nblocks);
+
+	bstrategy = GetAccessStrategy(BAS_NORMAL);
 
 	for (blkno = begin; blkno < end; blkno++)
 	{
-		HeapTuple tuple;
-		OffsetNumber offset;
-		OffsetNumber maxoffset;
-		OffsetNumber linesleft;
+		OffsetNumber offnum;
+		OffsetNumber maxoff;
+		Buffer buf;
 		Page page;
-		ItemId itemid;
 
-		page = BufferGetPage(blkno);
-		maxoffset = PageGetMaxOffsetNumber(page);
+		buf = ReadBufferExtended(onerel, MAIN_FORKNUM, blkno,
+						   RBM_NORMAL, bstrategy);
+		page = BufferGetPage(buf);
+		maxoff = PageGetMaxOffsetNumber(page);
 
-		offset = FirstOffsetNumber;
+		for (offnum = FirstOffsetNumber;
+			 offnum <= maxoff;
+			 offnum = OffsetNumberNext(offnum))
+		{
+			HeapTupleData tuple;
+			ItemId	itemid;
+
+			itemid = PageGetItemId(page, offnum);
+			tuple.t_data = (HeapTupleHeader) PageGetItem(page, itemid);
+			tuple.t_len = ItemIdGetLength(itemid);
+
+			n_read_tup++;
+		}
+
+		ReleaseBuffer(buf);
 	}
 
-
+	stats->n_read_tup = n_read_tup;
 }
 
 /*
@@ -414,7 +452,7 @@ brangescan_initialize_worker(shm_toc *toc, BRangeScanTask **task,
 	PScanStats *all_stats;
 
 	/* Look up for brange scan task */
-	*task = (TupleBRangeTask *) shm_toc_lookup(toc,
+	*task = (BRangeScanTask *) shm_toc_lookup(toc,
 											   KEY_BRANGESCAN_TASK);
 	/* Look up for scan statistics */
 	all_stats = (PScanStats *) shm_toc_lookup(toc,
@@ -429,6 +467,7 @@ p_brangescan(PG_FUNCTION_ARGS)
 	ParallelContext *pcxt;
 	Relation onerel;
 	PScanStats *all_stats;
+	BlockNumber tuples;
 
 	onerel = try_relation_open(relid, AccessShareLock);
 
@@ -449,7 +488,7 @@ p_brangescan(PG_FUNCTION_ARGS)
 	WaitForParallelWorkersToFinish(pcxt);
 
 	/* Report all statistics */
-	report_stats(all_stats);
+	tuples = report_stats(all_stats);
 
 	/* Finalize parallel scanning */
 	DestroyParallelContext(pcxt);
@@ -457,6 +496,6 @@ p_brangescan(PG_FUNCTION_ARGS)
 
 	relation_close(onerel, AccessShareLock);
 
-	PG_RETURN_NULL();
+	PG_RETURN_UINT32(tuples);
 }
 

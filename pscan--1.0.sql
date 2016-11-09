@@ -5,13 +5,13 @@
 
 -- Show visibility map information.
 CREATE FUNCTION p_tuplescan(regclass)
-RETURNS text
+RETURNS int
 AS 'MODULE_PATHNAME', 'p_tuplescan'
 LANGUAGE C STRICT;
 
 -- Show visibility map and page-level visibility information.
 CREATE FUNCTION p_brangescan(regclass)
-RETURNS text
+RETURNS int
 AS 'MODULE_PATHNAME', 'p_brangescan'
 LANGUAGE C STRICT;
 
