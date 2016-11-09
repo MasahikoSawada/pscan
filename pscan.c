@@ -313,7 +313,7 @@ p_tuplescan(PG_FUNCTION_ARGS)
 	
 	relation_close(onerel, AccessShareLock);
 
-	PG_RETURN_UINT32(tuples);
+	PG_RETURN_NULL();
 }
 
 /*
@@ -493,6 +493,6 @@ p_brangescan(PG_FUNCTION_ARGS)
 
 	relation_close(onerel, AccessShareLock);
 
-	PG_RETURN_UINT32(tuples);
+	PG_RETURN_NULL();
 }
 
