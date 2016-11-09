@@ -133,20 +133,6 @@ _PG_init(void)
 							NULL,
 							NULL,
 							NULL);
-
-	DefineCustomIntVariable("pscan.n_blocks",
-							"The number of blocks each worker read in brange scan mode",
-							NULL,
-							&pscan_blocks,
-							100,
-							1,
-							INT_MAX,
-							PGC_USERSET,
-							0,
-							NULL,
-							NULL,
-							NULL);
-
 }
 
 
