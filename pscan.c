@@ -39,8 +39,7 @@ PG_FUNCTION_INFO_V1(p_tuplescan);
 PG_FUNCTION_INFO_V1(p_brangescan);
 
 /* GUC variablies */
-int pscan_workers;
-int pscan_blocks;
+int pscan_nworkers;
 
 typedef struct PScanStats
 {
@@ -62,11 +61,12 @@ typedef struct BRangeScanTask
 	Oid relid;
 	int	nworkers;
 	int	nblocks;
+	char snapshot_data[FLEXIBLE_ARRAY_MEMBER];
 } BRangeScanTask;
 
 /* Common */
 void _PG_init(void);
-static BlockNumber report_stats(PScanStats *stat);
+static BlockNumber report_stats(PScanStats *stat, int nworkers);
 
 /* For tuple scan mode */
 static void tuplescan_estimate_dsm(ParallelContext *pcxt, Snapshot snapshot);
@@ -79,11 +79,13 @@ static void tuplescan_initialize_worker(shm_toc *toc, ParallelHeapScanDesc *psca
 										TupleScanTask **task, PScanStats **stats);
 
 /* For brange scan mode */
-static void brangescan_estimate_dsm(ParallelContext *pcxt);
-static PScanStats *brangescan_initialize_dsm(ParallelContext *pcxt, Relation onerel);
+static void brangescan_estimate_dsm(ParallelContext *pcxt, Snapshot snapshot);
+static PScanStats *brangescan_initialize_dsm(ParallelContext *pcxt, Relation onerel,
+											 Snapshot snapshot);
 static void p_brangescan_worker(dsm_segment *seg, shm_toc *toc);
 static void brangescan_scan_worker(Relation onerel, BlockNumber begin,
-								   BlockNumber nblocks, PScanStats *stats);
+								   BlockNumber nblocks, BRangeScanTask *task,
+								   PScanStats *stats);
 static void brangescan_initialize_worker(shm_toc *toc, BRangeScanTask **task,
 										 PScanStats **stats);
 
@@ -97,7 +99,7 @@ static void brangescan_initialize_worker(shm_toc *toc, BRangeScanTask **task,
  * Report scan statistics and return total block numer.
  */
 static BlockNumber
-report_stats(PScanStats *all_stats)
+report_stats(PScanStats *all_stats, int nworkers)
 {
 	StringInfoData info;
 	int i;
@@ -105,7 +107,7 @@ report_stats(PScanStats *all_stats)
 
 	initStringInfo(&info);
 
-	for (i = 0; i < pscan_workers; i++)
+	for (i = 0; i < nworkers; i++)
 	{
 		PScanStats *stats = all_stats + (sizeof(PScanStats) * i);
 
@@ -124,7 +126,7 @@ _PG_init(void)
 	DefineCustomIntVariable("pscan.n_workers",
 							"The number of parallel workers",
 							NULL,
-							&pscan_workers,
+							&pscan_nworkers,
 							1,
 							1,
 							INT_MAX,
@@ -155,7 +157,7 @@ tuplescan_estimate_dsm(ParallelContext *pcxt, Snapshot snapshot)
 	size += BUFFERALIGN(sizeof(TupleScanTask));
 	keys++;
 
-	size += BUFFERALIGN(sizeof(PScanStats) * pscan_workers);
+	size += BUFFERALIGN(sizeof(PScanStats) * pcxt->nworkers);
 	keys++;
 
 	shm_toc_estimate_chunk(&pcxt->estimator, size);
@@ -187,7 +189,7 @@ tuplescan_initialize_dsm(ParallelContext *pcxt, Relation onerel, Snapshot snapsh
 
 	/* Prepare for stats */
 	stats = (PScanStats *) shm_toc_allocate(pcxt->toc,
-											sizeof(PScanStats) * pscan_workers);
+											sizeof(PScanStats) * pcxt->nworkers);
 	shm_toc_insert(pcxt->toc, KEY_PSCAN_STATS, stats);
 
 	return stats;
@@ -264,11 +266,18 @@ Datum
 p_tuplescan(PG_FUNCTION_ARGS)
 {
 	Oid	relid = PG_GETARG_OID(0);
+	int nworkers = PG_GETARG_INT32(1);
 	ParallelContext *pcxt;
 	Relation onerel;
 	Snapshot snapshot;
 	PScanStats *all_stats;
 	BlockNumber tuples;
+
+	/*
+	 * nworkers == -1 means that caller didn't specify 2nd arg.
+	 * Use value of pscan.nworkers.
+	 */
+	nworkers = (nworkers == -1) ? pscan_nworkers : nworkers;
 
 	onerel = try_relation_open(relid, AccessShareLock);
 	
@@ -277,7 +286,7 @@ p_tuplescan(PG_FUNCTION_ARGS)
 	/* Begin parallel mode */
 	EnterParallelMode();
 
-	pcxt = CreateParallelContext(p_tuplescan_worker, pscan_workers);
+	pcxt = CreateParallelContext(p_tuplescan_worker, nworkers);
 	tuplescan_estimate_dsm(pcxt, snapshot);
 	InitializeParallelDSM(pcxt);
 
@@ -291,7 +300,7 @@ p_tuplescan(PG_FUNCTION_ARGS)
 	WaitForParallelWorkersToFinish(pcxt);
 	
 	/* Report all statistics */
-	tuples = report_stats(all_stats);
+	tuples = report_stats(all_stats, nworkers);
 
 	/* Finalize parallel scanning */
 	DestroyParallelContext(pcxt);
@@ -310,15 +319,17 @@ p_tuplescan(PG_FUNCTION_ARGS)
 
 /* Estimate DSM size for brange scan mode */
 static void
-brangescan_estimate_dsm(ParallelContext *pcxt)
+brangescan_estimate_dsm(ParallelContext *pcxt, Snapshot snapshot)
 {
 	int size = 0;
 	int keys = 0;
 
-	size += BUFFERALIGN(sizeof(BRangeScanTask));
+	//size += BUFFERALIGN(sizeof(BRangeScanTask));
+	size += add_size(offsetof(BRangeScanTask, snapshot_data),
+					 EstimateSnapshotSpace(snapshot));
 	keys++;
 
-	size += BUFFERALIGN(sizeof(PScanStats) * pscan_workers);
+	size += BUFFERALIGN(sizeof(PScanStats) * pcxt->nworkers);
 	keys++;
 
 	shm_toc_estimate_chunk(&pcxt->estimator, size);
@@ -326,22 +337,26 @@ brangescan_estimate_dsm(ParallelContext *pcxt)
 }
 
 static PScanStats*
-brangescan_initialize_dsm(ParallelContext *pcxt, Relation onerel)
+brangescan_initialize_dsm(ParallelContext *pcxt, Relation onerel, Snapshot snapshot)
 {
 	BRangeScanTask *task;
 	PScanStats	*stats;
+	int task_size;
 
 	/* Prepare for brange scan task */
+	task_size = add_size(offsetof(BRangeScanTask, snapshot_data),
+					EstimateSnapshotSpace(snapshot));
 	task = (BRangeScanTask *) shm_toc_allocate(pcxt->toc,
-											  sizeof(BRangeScanTask));
+											   task_size);
 	shm_toc_insert(pcxt->toc, KEY_BRANGESCAN_TASK, task);
 	task->relid = onerel->rd_id;
-	task->nworkers = pscan_workers;
+	task->nworkers = pcxt->nworkers;
 	task->nblocks = RelationGetNumberOfBlocks(onerel);
+	SerializeSnapshot(snapshot, task->snapshot_data);
 
 	/* Prepare for stats */
 	stats = (PScanStats *) shm_toc_allocate(pcxt->toc,
-										   sizeof(PScanStats) * pscan_workers);
+										   sizeof(PScanStats) * pcxt->nworkers);
 	shm_toc_insert(pcxt->toc, KEY_PSCAN_STATS, stats);
 
 	return stats;
@@ -366,12 +381,13 @@ p_brangescan_worker(dsm_segment *seg, shm_toc *toc)
 	/* Calculate begin block nubmer and the number of blocks have to read */
 	nblocks_per_worker = task->nblocks / task->nworkers;
 	begin = nblocks_per_worker * ParallelWorkerNumber;
-	if (begin + nblocks_per_worker > task->nblocks)
+	if (begin + (nblocks_per_worker*2) > task->nblocks)
+		/* I'm last worker so need to scan all remaining pages */
 		nblocks_worker = task->nblocks - begin;
 	else
 		nblocks_worker = nblocks_per_worker;
 
-	brangescan_scan_worker(rel, begin, nblocks_worker, stats);
+	brangescan_scan_worker(rel, begin, nblocks_worker, task, stats);
 
 	/* Save to statistics */
 	stats->begin_blkno = begin;
@@ -383,12 +399,18 @@ p_brangescan_worker(dsm_segment *seg, shm_toc *toc)
 
 static void
 brangescan_scan_worker(Relation onerel, BlockNumber begin, BlockNumber nblocks,
-					   PScanStats *stats)
+					   BRangeScanTask *task, PScanStats *stats)
 {
 	BlockNumber n_read_tup = 0;
 	BlockNumber blkno;
 	BlockNumber end = begin + nblocks;
 	BufferAccessStrategy bstrategy;
+	Snapshot snapshot;
+
+	/* Same as heap_beginscan_parallel */
+	snapshot = RestoreSnapshot(task->snapshot_data);
+	RegisterSnapshot(snapshot);
+	RelationIncrementReferenceCount(onerel);
 
 	bstrategy = GetAccessStrategy(BAS_NORMAL);
 
@@ -422,6 +444,11 @@ brangescan_scan_worker(Relation onerel, BlockNumber begin, BlockNumber nblocks,
 	}
 
 	stats->n_read_tup = n_read_tup;
+
+	/* Same as heap_endscan */
+	RelationDecrementReferenceCount(onerel);
+	FreeAccessStrategy(bstrategy);
+	UnregisterSnapshot(snapshot);
 }
 
 /*
@@ -447,22 +474,31 @@ Datum
 p_brangescan(PG_FUNCTION_ARGS)
 {
 	Oid	relid = PG_GETARG_OID(0);
+	int nworkers = PG_GETARG_INT32(1);
 	ParallelContext *pcxt;
 	Relation onerel;
 	PScanStats *all_stats;
 	BlockNumber tuples;
+	Snapshot snapshot;
 
+	/*
+	 * nworkers == -1 means that caller didn't specify 2nd arg.
+	 * Use value of pscan.nworkers.
+	 */
+	nworkers = (nworkers == -1) ? pscan_nworkers : nworkers;
 	onerel = try_relation_open(relid, AccessShareLock);
+
+	snapshot = GetActiveSnapshot();
 
 	/* Begin parallel mode */
 	EnterParallelMode();
 
-	pcxt = CreateParallelContext(p_brangescan_worker, pscan_workers);
-	brangescan_estimate_dsm(pcxt);
+	pcxt = CreateParallelContext(p_brangescan_worker, nworkers);
+	brangescan_estimate_dsm(pcxt, snapshot);
 	InitializeParallelDSM(pcxt);
 
 	/* Set up DSM are */
-	all_stats = brangescan_initialize_dsm(pcxt, onerel);
+	all_stats = brangescan_initialize_dsm(pcxt, onerel, snapshot);
 
 	/* Do parallel heap scan */
 	LaunchParallelWorkers(pcxt);
@@ -471,7 +507,7 @@ p_brangescan(PG_FUNCTION_ARGS)
 	WaitForParallelWorkersToFinish(pcxt);
 
 	/* Report all statistics */
-	tuples = report_stats(all_stats);
+	tuples = report_stats(all_stats, nworkers);
 
 	/* Finalize parallel scanning */
 	DestroyParallelContext(pcxt);
