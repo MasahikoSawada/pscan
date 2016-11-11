@@ -18,11 +18,35 @@ but it might be more faster in case where all data are located on buffer.
 `pscan.n_workers` specifies the number of parallel workers.
 
 # Functions
-## p_tuplescan(table)
+## p_tuplescan(regclass)
 
-Scan given table using tuple scanning method described above.
+Scan given table using tuple scanning method described above with parallel workers specified by `pscan.n_workers'.
 
-## p_brangescan(table)
+## p_brangescan(regclass)
 
-Scan given table using block range scanning method described above.
+Scan given table using block range scanning method described above with parallel workers specified by second argument.
 
+## p_tuplescan(regclass, int)
+
+Scan given table using tuple scanning method described above with parallel workers specified by `pscan.n_workers'.
+
+## p_brangescan(regclass, int)
+
+Scan given table using block range scanning method described above with parallel workers specified by second argument.
+
+# Compare with Parallel Seq Scan in PostgreSQL 9.6.
+
+To compare with Parallel SeqScan in PostgreSQL 9.6, Both p_tuplescan() and p_brangescan() do and don't
+following procedure.
+
+## Don't
+- Visibility check
+  - They're assumed that table doesn't have garbage and is all visible.
+- Filtering
+  - They fetch all tuples.
+
+## Do
+- Read page
+  - Allocate buffer and read all tuples on the page, and then release buffer.
+- Read tuple
+  - Fetch tuple one by one.
