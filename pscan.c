@@ -101,11 +101,8 @@ static void brangescan_initialize_worker(shm_toc *toc, BRangeScanTask **task,
 static BlockNumber
 report_stats(PScanStats *all_stats, int nworkers)
 {
-	StringInfoData info;
 	int i;
 	BlockNumber ntuples = 0;
-
-	initStringInfo(&info);
 
 	for (i = 0; i < nworkers; i++)
 	{
@@ -324,7 +321,6 @@ brangescan_estimate_dsm(ParallelContext *pcxt, Snapshot snapshot)
 	int size = 0;
 	int keys = 0;
 
-	//size += BUFFERALIGN(sizeof(BRangeScanTask));
 	size += add_size(offsetof(BRangeScanTask, snapshot_data),
 					 EstimateSnapshotSpace(snapshot));
 	keys++;
@@ -382,7 +378,7 @@ p_brangescan_worker(dsm_segment *seg, shm_toc *toc)
 	nblocks_per_worker = task->nblocks / task->nworkers;
 	begin = nblocks_per_worker * ParallelWorkerNumber;
 	if (begin + (nblocks_per_worker*2) > task->nblocks)
-		/* I'm last worker so need to scan all remaining pages */
+		/* I'm a last worker so need to scan all remaining pages */
 		nblocks_worker = task->nblocks - begin;
 	else
 		nblocks_worker = nblocks_per_worker;
@@ -517,4 +513,3 @@ p_brangescan(PG_FUNCTION_ARGS)
 
 	PG_RETURN_NULL();
 }
-
